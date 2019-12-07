@@ -1,5 +1,5 @@
 from strbuilder import StringBuilder, UsesStringBuilder
-from io import BytesIO
+import io
 
 
 COMPRESSED_FILE_FORMAT_MIN_VERSION = 21
@@ -18,76 +18,7 @@ def ticks2hms(ticks: int) -> str:
     return converted_ticks.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-class BufferedByteStream:
-    DEFAULT_BLKSIZE = 0x100000000
-
-    def __init__(self, stream, blksize = DEFAULT_BLKSIZE):
-        self._stream = stream
-        self._blksize = blksize
-        self._chunk = self._stream.read(self._blksize)
-        self._chunk_start = 0
-        self._mark_offset = 0
-
-    @classmethod
-    def open(cls, fname: str, blksize = DEFAULT_BLKSIZE) -> 'BufferedReader':
-        fd = open(fname, 'rb')
-        return cls(fd, blksize)
-
-    def close(self) -> None:
-        self._stream.close()
-
-    def __enter__(self) -> 'BufferedByteReader':
-        return self
-
-    def __exit__(self, *args) -> None:
-        self.close()
-
-    def __getitem__(self, pos) -> bytes:
-        if isinstance(pos, int):
-            self.seek(pos)
-            return self._chunk[self._mark_offset]
-        elif isinstance(pos, slice):
-            buf = bytearray()
-            for mark in range(pos.start, pos.stop, pos.step):
-                self.seek(mark)
-                buf.append(self.read(1))
-            return bytes(buf)
-
-    def seek(self, pos: int) -> int:
-        chunk_start, self._mark_offset = (pos // self._blksize) * self._blksize, pos % self._blksize
-
-        if chunk_start != self._chunk_start:
-            self._stream.seek(chunk_start)
-            self._chunk = self._stream.read(self._blksize)
-
-        self._chunk_start = chunk_start
-
-        return self.tell()
-
-    def tell(self) -> int:
-        return self._chunk_start + self._mark_offset
-
-    def read(self, size = -1) -> bytes:
-        buf = bytearray()
-
-        byt = None
-        while byt != b'' and (len(buf) < size or size == -1):
-            mark = self.tell()
-            byt = self[mark]
-            self.seek(mark + 1)
-            buf.append(byt)
-
-        return bytes(buf)
-
-    def peek(self, size = -1) -> bytes:
-        old_mark = self.tell()
-        data = self.read(size)
-        self.seek(old_mark)
-
-        return data
-
-
-class CSSSavFile(BufferedByteStream):
+class CSSSavFile(io.BufferedReader):
     def read_int(self, bytecount: int = 4) -> int:
         return int.from_bytes(self.read(bytecount), 'little', signed=False)
 
@@ -126,7 +57,7 @@ class ZlibChunk(CSSSavFile, UsesStringBuilder):
 
         super().__init__(decompressed_data_stream)
 
-    def decompress(self, data: CSSSavFile) -> BytesIO:
+    def decompress(self, data: CSSSavFile) -> io.BytesIO:
         import zlib
 
         self.PACKAGE_FILE_TAG = data.read_int(4)
@@ -140,7 +71,7 @@ class ZlibChunk(CSSSavFile, UsesStringBuilder):
         byte_data = zlib.decompress(compressed_data, bufsize=self.current_chunk_uncompressed_len)
         if len(byte_data) != self.current_chunk_uncompressed_len:
             raise RuntimeWarning('ZlibChunk bytes length != decompressed length from metadata')
-        return BytesIO(byte_data)
+        return io.BytesIO(byte_data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
         sb.appendln('PACKAGE_FILE_TAG: %d' % self.PACKAGE_FILE_TAG)
@@ -239,17 +170,18 @@ class BodyData(UsesStringBuilder):
 
 class WorldObjectDataArray(UsesStringBuilder):
     def __init__(self, data: CSSSavFile):
-        count = data.read_int()
+        self.count = data.read_int()
+        self.zlib_data = ZlibData(data)
 
-        self.world_objects = [
-            ZlibChunk(data)
-        ]
-        # zlib_data = ZlibData(data)
+        self.world_objects = []
+        zlib_data = ZlibData(data)
 
-        # for _ in range(count):
-        #     item = WorldObject(zlib_data)
+        for _ in range(1):
+            item = WorldObject(zlib_data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
+        sb.appendln('Count: %d' % self.count)
+
         for idx, item in enumerate(self.world_objects):
             sb.appendln('World object[%d]' % idx)
             sb.indent()
@@ -283,6 +215,7 @@ if __name__ == '__main__':
     else:
         fname = sys.argv[1]
 
-    with CSSSavFile.open(fname) as fin:
+    with open(fname, 'rb') as raw_fin:
+        fin = CSSSavFile(raw_fin)
         file = SaveFile(fin)
         print(file)

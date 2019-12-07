@@ -1,4 +1,5 @@
 from strbuilder import StringBuilder, UsesStringBuilder
+from io import BytesIO
 
 
 COMPRESSED_FILE_FORMAT_MIN_VERSION = 21
@@ -121,11 +122,11 @@ class CSSSavFile(BufferedByteStream):
 
 class ZlibChunk(CSSSavFile, UsesStringBuilder):
     def __init__(self, compressed_data: CSSSavFile):
-        self.decompress(compressed_data)
+        decompressed_data_stream = self.decompress(compressed_data)
 
-        super().__init__(compressed_data.bytes)
+        super().__init__(decompressed_data_stream)
 
-    def decompress(self, data: CSSSavFile) -> None:
+    def decompress(self, data: CSSSavFile) -> BytesIO:
         import zlib
 
         self.PACKAGE_FILE_TAG = data.read_int(4)
@@ -136,16 +137,15 @@ class ZlibChunk(CSSSavFile, UsesStringBuilder):
         data.read_int(8)  # Dupe of current_chunk_decompressed_len
 
         compressed_data = data.read(self.current_chunk_compressed_len)
-        self.bytes = zlib.decompress(compressed_data, bufsize=self.current_chunk_uncompressed_len)
-        if len(self.bytes) != self.current_chunk_uncompressed_len:
+        byte_data = zlib.decompress(compressed_data, bufsize=self.current_chunk_uncompressed_len)
+        if len(byte_data) != self.current_chunk_uncompressed_len:
             raise RuntimeWarning('ZlibChunk bytes length != decompressed length from metadata')
+        return BytesIO(byte_data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
         sb.appendln('PACKAGE_FILE_TAG: %d' % self.PACKAGE_FILE_TAG)
         sb.appendln('Max chunk size: %d' % self.maximum_chunk_size)
         sb.appendln('Chunk size (compressed -> uncompressed): %d -> %d' % (self.current_chunk_compressed_len, self.current_chunk_uncompressed_len))
-        sb.appendln('CMF: %b' % self.cmf)
-        sb.appendln('FLG: %b' % self.flg)
 
         return sb
 
@@ -232,7 +232,7 @@ class BodyData(UsesStringBuilder):
         self.world_object_list = WorldObjectDataArray(data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
-        self.world_object_list(sb)
+        self.world_object_list.to_sb(sb)
 
         return sb
 
@@ -241,11 +241,13 @@ class WorldObjectDataArray(UsesStringBuilder):
     def __init__(self, data: CSSSavFile):
         count = data.read_int()
 
-        zlib_data = ZlibData(data)
-        self.world_objects = []
+        self.world_objects = [
+            ZlibChunk(data)
+        ]
+        # zlib_data = ZlibData(data)
 
-        for _ in range(count):
-            item = WorldObject(zlib_data)
+        # for _ in range(count):
+        #     item = WorldObject(zlib_data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
         for idx, item in enumerate(self.world_objects):

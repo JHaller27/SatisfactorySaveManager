@@ -17,49 +17,86 @@ def ticks2hms(ticks: int) -> str:
     return converted_ticks.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-class CSSBytes:
-    def __init__(self, data: bytes):
-        self.bytes = data
-        self.mark = 0
+class BufferedByteStream:
+    DEFAULT_BLKSIZE = 0x100000000
+
+    def __init__(self, stream, blksize = DEFAULT_BLKSIZE):
+        self._stream = stream
+        self._blksize = blksize
+        self._chunk = self._stream.read(self._blksize)
+        self._chunk_start = 0
+        self._mark_offset = 0
 
     @classmethod
-    def from_file(cls, fname: str) -> 'CSSBytes':
-        with open(fname, 'rb') as fin:
-            data = fin.read()
-        return cls(data)
+    def open(cls, fname: str, blksize = DEFAULT_BLKSIZE) -> 'BufferedReader':
+        fd = open(fname, 'rb')
+        return cls(fd, blksize)
 
-    def __getitem__(self, idx) -> bytes:
-        return self.bytes[idx]
+    def close(self) -> None:
+        self._stream.close()
 
-    def __len__(self) -> int:
-        return len(self.bytes)
+    def __enter__(self) -> 'BufferedByteReader':
+        return self
 
-    def peek(self, bytecount: int = -1) -> bytes:
-        if bytecount == -1:
-            return self[self.mark:]
+    def __exit__(self, *args) -> None:
+        self.close()
 
-        return self[self.mark:self.mark + bytecount]
+    def __getitem__(self, pos) -> bytes:
+        if isinstance(pos, int):
+            self.seek(pos)
+            return self._chunk[self._mark_offset]
+        elif isinstance(pos, slice):
+            buf = bytearray()
+            for mark in range(pos.start, pos.stop, pos.step):
+                self.seek(mark)
+                buf.append(self.read(1))
+            return bytes(buf)
 
-    def read(self, bytecount: int = -1) -> bytes:
-        if bytecount == -1:
-            start = self.mark
-            self.mark = len(self.bytes)
-            return self[start:]
+    def seek(self, pos: int) -> int:
+        chunk_start, self._mark_offset = (pos // self._blksize) * self._blksize, pos % self._blksize
 
-        start = self.mark
-        self.mark += bytecount
-        return self[start:self.mark]
+        if chunk_start != self._chunk_start:
+            self._stream.seek(chunk_start)
+            self._chunk = self._stream.read(self._blksize)
 
+        self._chunk_start = chunk_start
+
+        return self.tell()
+
+    def tell(self) -> int:
+        return self._chunk_start + self._mark_offset
+
+    def read(self, size = -1) -> bytes:
+        buf = bytearray()
+
+        byt = None
+        while byt != b'' and (len(buf) < size or size == -1):
+            mark = self.tell()
+            byt = self[mark]
+            self.seek(mark + 1)
+            buf.append(byt)
+
+        return bytes(buf)
+
+    def peek(self, size = -1) -> bytes:
+        old_mark = self.tell()
+        data = self.read(size)
+        self.seek(old_mark)
+
+        return data
+
+
+class CSSSavFile(BufferedByteStream):
     def read_int(self, bytecount: int = 4) -> int:
         return int.from_bytes(self.read(bytecount), 'little', signed=False)
 
-    def get_presized_block(self, presize_len: int = 4) -> 'CSSBytes':
+    def get_presized_block(self, presize_len: int = 4) -> 'CSSSavFile':
         size_len = self.read_int(presize_len)
-        return CSSBytes(self.read(size_len))
+        return CSSSavFile(self.read(size_len))
 
-    def get_array(self, item_size: int, precount_len: int = 4) -> 'CSSBytes':
+    def get_array(self, item_size: int, precount_len: int = 4) -> 'CSSSavFile':
         count = self.read_int(precount_len)
-        return CSSBytes(self.read(item_size * count))
+        return CSSSavFile(self.read(item_size * count))
 
     def read_varlen_str(self) -> str:
         s = ''
@@ -82,13 +119,13 @@ class CSSBytes:
         return s
 
 
-class ZlibChunk(CSSBytes, UsesStringBuilder):
-    def __init__(self, compressed_data: CSSBytes):
+class ZlibChunk(CSSSavFile, UsesStringBuilder):
+    def __init__(self, compressed_data: CSSSavFile):
         self.decompress(compressed_data)
 
         super().__init__(compressed_data.bytes)
 
-    def decompress(self, data: CSSBytes) -> None:
+    def decompress(self, data: CSSSavFile) -> None:
         import zlib
 
         self.PACKAGE_FILE_TAG = data.read_int(4)
@@ -113,8 +150,8 @@ class ZlibChunk(CSSBytes, UsesStringBuilder):
         return sb
 
 
-class ZlibData(CSSBytes):
-    def __init__(self, data: CSSBytes):
+class ZlibData(CSSSavFile):
+    def __init__(self, data: CSSSavFile):
         self.compressed_bytes = data
         super().__init__(ZlibChunk(self.compressed_bytes))
 
@@ -140,13 +177,13 @@ class ZlibData(CSSBytes):
 
 
 class SaveFile(UsesStringBuilder):
-    def __init__(self, data: CSSBytes):
+    def __init__(self, data: CSSSavFile):
         self.header = HeaderData(data)
         self.body = BodyData(data)
 
     @classmethod
     def from_file(cls, fname: str) -> 'SaveFile':
-        return cls(CSSBytes.from_file(fname))
+        return cls(CSSSavFile.from_file(fname))
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
         sb.appendln('Header')
@@ -163,7 +200,7 @@ class SaveFile(UsesStringBuilder):
 
 
 class HeaderData(UsesStringBuilder):
-    def __init__(self, data: CSSBytes):
+    def __init__(self, data: CSSSavFile):
         self.header_version = data.read_int()
         self.save_version = data.read_int()
         self.build_version = data.read_int()
@@ -191,7 +228,7 @@ class HeaderData(UsesStringBuilder):
 
 
 class BodyData(UsesStringBuilder):
-    def __init__(self, data: CSSBytes):
+    def __init__(self, data: CSSSavFile):
         self.world_object_list = WorldObjectDataArray(data)
 
     def to_sb(self, sb: StringBuilder = StringBuilder()) -> StringBuilder:
@@ -201,7 +238,7 @@ class BodyData(UsesStringBuilder):
 
 
 class WorldObjectDataArray(UsesStringBuilder):
-    def __init__(self, data: CSSBytes):
+    def __init__(self, data: CSSSavFile):
         count = data.read_int()
 
         zlib_data = ZlibData(data)
@@ -221,7 +258,7 @@ class WorldObjectDataArray(UsesStringBuilder):
 
 
 class WorldObject(UsesStringBuilder):
-    def __init__(self, data: CSSBytes):
+    def __init__(self, data: CSSSavFile):
         self.name = data.read_str()
         self.property_type = data.read_str()
         self.value_len = data.read_int()
@@ -244,5 +281,6 @@ if __name__ == '__main__':
     else:
         fname = sys.argv[1]
 
-    file = SaveFile.from_file(fname)
-    print(file)
+    with CSSSavFile.open(fname) as fin:
+        file = SaveFile(fin)
+        print(file)
